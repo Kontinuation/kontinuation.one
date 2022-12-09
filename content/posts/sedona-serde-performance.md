@@ -35,16 +35,16 @@ as an example, you can easily spot the serialization and deserialization code
 in the `eval` method.
 
 ```scala
-  override def eval(input: InternalRow): Any = {
-    val geometry = inputExpressions(0).toGeometry(input)
-    val sourceCRSString = inputExpressions(1).asString(input)
-    val targetCRSString = inputExpressions(2).asString(input)
-    val lenient = inputExpressions(3).eval(input).asInstanceOf[Boolean]
-    (geometry,sourceCRSString,targetCRSString,lenient) match {
-      case (null,_,_,_)  => null
-      case _ => Functions.transform(geometry, sourceCRSString, targetCRSString, lenient).toGenericArrayData
-    }
+override def eval(input: InternalRow): Any = {
+  val geometry = inputExpressions(0).toGeometry(input)
+  val sourceCRSString = inputExpressions(1).asString(input)
+  val targetCRSString = inputExpressions(2).asString(input)
+  val lenient = inputExpressions(3).eval(input).asInstanceOf[Boolean]
+  (geometry,sourceCRSString,targetCRSString,lenient) match {
+    case (null,_,_,_)  => null
+    case _ => Functions.transform(geometry, sourceCRSString, targetCRSString, lenient).toGenericArrayData
   }
+}
 ```
 
 Now we know that serialization and deserialization of geometry objects are the
@@ -68,7 +68,7 @@ indicates the cost of geometry object deserialization, which takes 64% of total
 running time. Spark SQL is not throwing most of our computation power to the
 geometry serde instead of doing useful work.
 
-![flamegraph_unopt_range_query](/flamegraph_unoptimized_range_query.png)
+![flamegraph_unopt_range_query](/sedona-serde-performance/flamegraph_unoptimized_range_query.png)
 
 Now we know that geometry serde is the bottleneck of some particular kind of
 Spatial SQL query, it is time to optimize it.
@@ -174,10 +174,108 @@ To understand the make up of computational costs when serializing and
 deserializing geometry objects, we can profile it using a profiler. JMH has
 builtin integration with async-profiler, so that we can instruct JMH to profile
 it when running the benchmark. Let's run the benchmark of serializing
-MultiPolygons with `segment = 48` as an example:
+MultiPolygons with `segment = 16` as an example:
 
-```sql
-
+```bash
+java -jar ./build/libs/play-with-geometry-serde-1.0-SNAPSHOT-jmh.jar "BenchmarkWkbSerde.serializeMultiPolygon" -f 1 -p "segments=16" -r 5s -w 5s -prof async:libPath=/path/to/libasyncProfiler.so\;output=flamegraph
 ```
 
-## Improving the Performance of `ShapeSerde`
+First let's find out why WKB is slow. Most of its time was spent on
+[`WKBWriter.writeCoordinate`](https://github.com/locationtech/jts/blob/1.19.0/modules/core/src/main/java/org/locationtech/jts/io/WKBWriter.java#L434-L452). Its
+implementation involves reordering eight bytes for floating point numbers
+manually in
+[`ByteOrderValues.putLong`](https://github.com/locationtech/jts/blob/1.19.0/modules/core/src/main/java/org/locationtech/jts/io/ByteOrderValues.java#L82-L104)
+and reallocations of the byte array in `ByteArrayOutputStream.write`. We may
+wonder if the JIT compiler is smart enough to skip reordering when the byte
+order of `WKBWriter` is native byte order, unfortunatally it is not the
+case. We've also benchmarked `WkbSerdeBigEndian` and the result is about the
+same with `WkbSerde`.
+
+![flamegraph_wkb_serde](/sedona-serde-performance/flamegraph_wkb_serde.png)
+
+The next thing to see is the profiling result of `KryoSerde`. We can
+immediately spot one big anomaly in the profiling result: why do we need to
+create JTS points when serializing something? We should not create any geometry
+objects in the serialization process.
+
+![flamegraph_kryo_serde](/sedona-serde-performance/flamegraph_kryo_serde.png)
+
+The `GeometryFactory.createPoint` call took lots of time when serializing
+geometry objects. We expect a huge performance improvement after pulling out
+this sting. It is in
+[`ShapeSerde.putPoints`](https://github.com/apache/incubator-sedona/blob/sedona-1.3.0-incubating/core/src/main/java/org/apache/sedona/core/formatMapper/shapefileParser/parseUtils/shp/ShapeSerde.java#L254). We
+can replace invocation of `getPointN` with `getCoordinateN` to avoid the
+creation of point objects.
+
+When it comes to deserialization, `WkbSerde` is slow in the same way with
+serialization. `KryoSerde` is much slower than `ShapeSerde`, while it is mostly
+based on `ShapeSerde`. We found that the extra performance cost introduced to
+`KryoSerde` was in the
+[`ShapeReader`](https://github.com/apache/incubator-sedona/blob/sedona-1.3.0-incubating/core/src/main/java/org/apache/sedona/core/formatMapper/shapefileParser/parseUtils/shp/ShapeReaderFactory.java#L71-L75). Each
+time the deserializer reads a floating point number, it fetches 8 bytes from
+the Kryo input object, create a ByteBuffer object, then get a floating point
+number out of it. There are too many small reads to the Kryo input stream and
+we've wasted too much time creating ByteBuffer objects when the geometry to be
+deserialized contains lots of coordinates.
+
+![flamegraph_kryo_deserialize_bytebuffer](/sedona-serde-performance/flamegraph_kryo_deserialize_bytebuffer.png)
+
+```java
+@Override
+public double readDouble() {
+  return toByteBuffer(input, 8).getDouble();
+}
+
+private static ByteBuffer toByteBuffer(Input input, int numBytes) {
+  byte[] bytes = new byte[numBytes];
+  input.read(bytes);
+  return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+}
+```
+
+A better way of reading coordinates from Kryo input is to read multiple
+coordinates at once. We can read a large chunk of byte array from Kryo input
+each time we want to read a CoordinateSequence of multiple coordinates.
+
+```java
+@Override
+public void readCoordinates(CoordinateSequence coordinateSequence, int numCoordinates) {
+  ByteBuffer bb = toByteBuffer(input, numCoordinates * 16);
+  for (int k = 0; k < numCoordinates; k++) {
+    coordinateSequence.setOrdinate(k, 0, bb.getDouble(16 * k));
+    coordinateSequence.setOrdinate(k, 1, bb.getDouble(16 * k + 8));
+  }
+}
+```
+
+## Improving the Performance of `KryoSerde` and `ShapeSerde`
+
+We've fixed the performance problems mentioned above in our own fork
+[here](https://github.com/Kontinuation/play-with-geometry-serde/tree/v1.0.0/src/main/java/org/apache/sedona/core/optimized/formatMapper/shapefileParser/parseUtils/shp). Benchmark
+shows that our fix improved serde performance by roughly 30%, and the
+performance gap between `KryoSerde` and `ShapeSerde` has also became smaller.
+
+```
+Benchmark                                                   (segments)   Mode  Cnt         Score         Error  Units
+BenchmarkKryoSerde.deserializeMultiPolygon                          16  thrpt   15    445317.627 ±    8713.265  ops/s
+BenchmarkKryoSerdeOptimized.deserializeMultiPolygon                 16  thrpt   15    637855.796 ±   22901.547  ops/s
+BenchmarkShapeSerdeOptimized.deserializeMultiPolygon                16  thrpt   15    583509.084 ±  240406.288  ops/s
+BenchmarkKryoSerde.serializeMultiPolygon                            16  thrpt   15    678090.693 ±   12838.073  ops/s
+BenchmarkKryoSerdeOptimized.serializeMultiPolygon                   16  thrpt   15    827620.426 ±  180365.455  ops/s
+BenchmarkShapeSerdeOptimized.serializeMultiPolygon                  16  thrpt   15   1296729.904 ±   16064.890  ops/s
+```
+
+## How Can We Do Better?
+
+Til now, the obvious performance problems in `ShapeSerde` have already been
+resolved. We need to dig deeper to get better performance. We can hardly find
+anything to improve by looking at `ShapeSerde`'s code, it is already a very
+compact, hassle free implementation of geometry serde using
+`java.nio.ByteBuffer`. The profiling result shows that the next thing to
+improve might be `ByteBuffer.getDouble` (though profiling result was not that
+accurate when everything was heavily inlined by the C2 optimizer), what can we
+do to improve the performance of reading 64-bit floating point number from a
+byte buffer?
+
+![flamegraph_byte_buffer_slow_get_double](/sedona-serde-performance/flamegraph_byte_buffer_slow_get_double.png)
+
