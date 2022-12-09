@@ -170,9 +170,14 @@ We can conclude that the performance of `KryoSerde` is slightly better than
 optimizing serde performance. However, we need to interpret these numbers with
 caution to fully understand the benchmark results.
 
-> REMEMBER: The numbers below are just data. To gain reusable insights, you
-need to follow up on why the numbers are the way they are. Use profilers (see
--prof, -lprof), design factorial experiments, perform baseline and negative
-tests that provide experimental control, make sure the benchmarking environment
-is safe on JVM/OS/HW level, ask for reviews from the domain experts.  Do not
-assume the numbers tell you what you want them to tell.
+To understand the make up of computational costs when serializing and
+deserializing geometry objects, we can profile it using a profiler. JMH has
+builtin integration with async-profiler, so that we can instruct JMH to profile
+it when running the benchmark. Let's run the benchmark of serializing
+MultiPolygons with `segment = 48` as an example:
+
+```sql
+
+```
+
+## Improving the Performance of `ShapeSerde`
