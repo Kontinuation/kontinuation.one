@@ -9,11 +9,11 @@ tags:
   - performance optimization
 ---
 
-[Apache Sedona](https://sedona.apache.org/) is an amazing software. It brings
+[Apache Sedona](https://sedona.apache.org/) is an amazing project. It brings
 distributed geospatial processing capabilities to popular cluster computing
 systems such as Apache Spark and Apache Flink. In this post we'll investigate
 on the performance characteristics of Spatial SQL on Apache Spark, and improve
-the performance of Spatial SQL by tinkering with the geometry object
+the performance of Spatial SQL by optimizing the geometry object
 serializer/deserializer in Apache Sedona.
 
 ## Why Do We Care About the Performance of Geometry Serdes?
@@ -520,20 +520,177 @@ With these principles in mind, let's design our geometry serialization format.
 
 ### The Overall Design
 
+Our proposed serialization format is similar with WKB, the major difference is that
+the coordinate values were always aligned to 8-bytes boundaries. The serialized buffer consists of 3 parts:
+
+1. The header, which is the first 8 bytes of the serialized buffer containing the geometry type, coordinate dimensions, SRID (optional) and total number of coordinates.
+2. The coordinate data, which contains the coordinates of all points in the geometry.
+3. The structure data is a series of 32-bit integers, which contains the structure of the geometry. For example, the structure of a MultiPolygon is the number of polygons, the number of rings in each polygon, and the number of coordinates in each ring.
+
+By storing coordinate data and structure data separatedly, we can make sure that the coordinate data and structure data are always aligned to word boundaries.
+
+```
+[   header  ] [  coordinate data  ] [  structure data  ]
+|< 8 bytes >| |< variable length >| |< variable length>|
+```
+
+The subsections below will explain the details of the format.
+
 #### Header
+
+The header has a fixed size of 8 bytes. It contains one preamble byte, 3 bytes for SRID, and 4 bytes for the total number of coordinates.
+
+```
+[ preamble ] [srid_hi] [srid_mid] [srid_lo] [ numCoordinates  ]
+|< 1 byte >| |<-         3 bytes        ->| |<-   4 bytes   ->|
+```
+
+The preamble byte is used to store the geometry type, coordinate dimensions and SRID flag. The first 4 bits are used to store the geometry type, the next 3 bits are used to store the coordinate dimensions, and the last bit is used to store the SRID flag.
+
+```
+[ geometryType  ] [  coordinateType  ] [ SRID flag ]
+|<-   4 bits  ->| |<-    3 bits    ->| |<- 1 bit ->|
+```
+
+The geometry type value is defined in the same way as 2D geometries in WKB:
+
+| Geometry Type | Value |
+|---------------|-------|
+| Point         | 1     |
+| LineString    | 2     |
+| Polygon       | 3     |
+| MultiPoint    | 4     |
+| MultiLineString | 5   |
+| MultiPolyogn  | 6     |
+| GeometryCollection | 7 |
+
+The coordinate type value is defined as follows:
+
+| Coordinate Type | Value |
+|-----------------|-------|
+| XY   | 1 |
+| XYZ  | 2 |
+| XYM  | 3 |
+| XYZM | 4 |
+
+We use 3 bytes (24 bits) to store the SRID of the geometry. The SRID flag in the preamble byte is used to indicate whether the SRID is specified. If the SRID flag is 0, the SRID is not specified and the 3 bytes for SRID are all 0. If the SRID flag is 1, the SRID is specified and the 3 bytes for SRID are used to store the SRID in
+big-endian order. We know that SRID is a 32-bit integer in JTS, thus serializing SRID as 3 bytes rules out some geometries with large SRID values. We don't think this is a problem since SRIDs larger than 16777215 are rarely used, and the [GSERIALIZED](https://github.com/postgis/postgis/blob/3.3.2/liblwgeom/gserialized.txt) format defined by PostGIS also uses 3 bytes (21 bits actually) to store SRIDs and we didn't see much complains about that.
+
+The total number of coordinates is stored in a 32-bit integer in native byte order. It is used to calculate the size of the coordinate data.
+
+The header could be represented by ANSI C struct as follows:
+
+```c
+struct Preamable {
+  int geometryType : 4;
+  int coordinateType: 3;
+  boolean sridFlag: 1;
+}
+
+struct Header {
+  Preamable preamble;
+  unsigned char srid[3];
+  int numCoordinates;
+}
+```
+
+#### Coordinate Data
+
+The coordinate data is a contiguous array of ordinate values. The size of the coordinate data is calculated by multiplying the total number of coordinates by the size of each coordinate. The size of each coordinate is determined by the coordinate type.
+
+Each ordinate was stored as an 8-byte floating point number in native byte order. Ordinates of the same coordinate were stored consecutively. For example, the coordinate data of a 2D point is 16 bytes long, and the coordinate data of a 3D point is 24 bytes long.
+
+#### Structure Data
+
+The structure data is a contiguous array of 32-bit integers. The content
+of structure data is defined differently for each type of geometry. We'll show you the structure data of each geometry type in the next section.
+
+### Format of Each Geometry Type
 
 #### Point
 
+An empty point can be serialized as 8 bytes, which is the size of the header. The `numCoordinates` field in the header should be 0.
+
+A non-empty point should have a header with `numCoordinates` value set to 1, followed by the coordinate data.
+
+The structure data is empty in both cases.
+
 #### LineString
+
+A LineString is serialized as a header followed by the coordinate data. The `numCoordinates` field in the header should be set to the number of points in the LineString. The structure data is always empty.
 
 #### Polygon
 
+A Polygon is serialized as a header followed by the coordinate data. The `numCoordinates` field in the header should be set to the number of points in the Polygon (total number of points in exterior ring and inner rings). 
+
+The structure data contains the number of rings in the Polygon, and the number of points in each ring. For example, a polygon with an exterior ring with 5 points and an interior ring with 3 points will have the following structure data:
+
+```
+[ 2 ] [ 5 ] [ 3 ]
+  ^     ^      ^
+  |     |      |
+  |     |      +-- number of points in inner ring 1
+  |     +-- number of points in the exterior ring
+  +-- number of rings
+```
+
 #### MultiPoint
+
+A MultiPoint is serialized as a header followed by the coordinate data. The `numCoordinates` field in the header should be set to the total number of points in the MultiPoint. The structure data is always empty.
+
+Empty points in MultiPoint are serialized with all ordinates set to NaN.
 
 #### MultiLineString
 
+A MultiLineString is serialized as a header followed by the coordinate data. The `numCoordinates` field in the header should be set to the total number of points in the MultiLineString. The structure data contains the number of LineStrings in the MultiLineString, and the number of points in each LineString.
+
 #### MultiPolygon
+
+A MultiPolygon is serialized as a header followed by the coordinate data. The `numCoordinates` field in the header should be set to the total number of points in the MultiPolygon.
+
+The structure data contains the number of Polygons in the MultiPolygon, the number of rings in each Polygon, and the number of points in each ring. For example, a MultiPolygon with a Polygon with an exterior ring with 5 points and an interior ring with 3 points, and a Polygon with an exterior ring with 4 points will have the following structure data:
+
+```
+[ 2 ] [ 2 ] [ 5 ] [ 3 ] [ 1 ] [ 4 ]
+  ^     ^     ^     ^     ^     ^
+  |     |     |     |     |     |
+  |     |     |     |     |     +-- number of points in the exterior ring of polygon 2
+  |     |     |     |     +-- number of rings in polygon 2
+  |     |     |     +-- number of points in inner ring 1 of polygon 1
+  |     |     +-- number of points in the exterior ring of polygon 1
+  |     +-- number of rings in polygon 1
+  +-- number of polygons
+
+```
 
 #### GeometryCollection
 
+A GeometryCollection is serialized as a header followed by serialized geometry data of each geometry in the collection. The `numCoordinates` field in the header should be set to the total number of geometries in the GeometryCollection.
 
+The serialized geometry data of each geometry were aligned to 8-bytes boundaries. Paddings should be added when necessary and the values of padding bytes were unspecified.
+
+### Benchmark Results
+
+We've implemented the proposed format in [com.spatialx.fastserde.GeometrySerializer](https://github.com/Kontinuation/play-with-geometry-serde/blob/main/src/main/java/com/spatialx/fastserde/GeometrySerializer.java). This geometry serde has 2 buffer accessors: one was backed by `Unsafe` and the other was backed by `ByteBuffer`. We've benchmarked the proposed serde with both buffer accessors and obtained the following results. We can see that the performance of the Unsafe variant of our proposed serde is way faster than other serdes. The performance of the ByteBuffer variant is on par with `ShapeSerdeOptimized` and significantly slower than the `Unsafe` variant. This is because the performance of `ByteBuffer` is quite poor compared to `Unsafe` on JDK 8.
+In practice, we use the `Unsafe` variant of our proposed serde in production environment, and fallback to the `ByteBuffer` variant when `sun.misc.Unsafe` is not available.
+
+![benchmark_results_geometry_serdes](/sedona-serde-performance/benchmark_results_geometry_serdes.png)
+
+We've only plotted the results of serializing/deserializing geometries with 16 segments. Detailed benchmark results can be found in the [README](https://github.com/Kontinuation/play-with-geometry-serde/blob/main/README.md) of the benchmark project.
+
+## Overall Performance Improvement of Spatial SQL
+
+We've implemented the proposed geometry serde in [our own fork](https://github.com/Kontinuation/incubator-sedona/tree/fast-geometry-serde) of Apache Sedona and observed 2x speed up of range queries.
+
+| Spatial SQL | Geometry Type | Record Count | Result Count | Cost with existing serde | Cost with proposed serde |
+| ----------- | ------------- | ------------ | ------------ | ---- | ---- |
+| `SELECT COUNT(1) FROM traj_points WHERE ST_Within(geom, ...)` | Point | 62,909,383 | 856,881 | 20 s | **9 s** |
+| `SELECT COUNT(1) FROM ms_buildings WHERE ST_Within(geom, ...)` | Polygon | 18,553,228 | 460 | 8 s | **4 s** |
+
+Although we've achieved remarkable speed up by optimizing the geometry serde, there is still significant proportion of time spent on geometry serde when running range queries. We can perform further optimization by avoiding repeatedly serializing/deserializing the constant geometry in the WHERE clause. This optimization is out of the scope of this proposal and we will work on it in the future.
+
+![benchmark_range_query_with_fastserde](/sedona-serde-performance/benchmark_range_query_with_fastserde.png)
+
+## Future Work
+
+There're a lot of things to do to integrate it into Apache Sedona. We'll implement a python version of proposed serde as a C extension, and also implement a pure python version using struct package as a fallback.
