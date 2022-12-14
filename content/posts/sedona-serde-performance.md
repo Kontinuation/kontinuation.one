@@ -418,7 +418,7 @@ static double getDouble(ByteBuffer bb, int bi, boolean bigEndian) {
 The assembly and source code above were obtained from JDK 8. We've also found
 that the implementation of `java.nio.HeapByteBuffer` has changed in JDK 11,
 [`HeapByteBuffer.getDouble`](https://github.com/AdoptOpenJDK/openjdk-jdk11/blob/master/src/java.base/share/classes/java/nio/Heap-X-Buffer.java.template#L544-L552)
-calls `UNSAFE.getLongUnaligned` to read a 64-bit long nstead of calling
+calls `UNSAFE.getLongUnaligned` to read a 64-bit long instead of calling
 `java.nio.Bits`. `Unsafe.getLongUnaligned` is a HotSpot intrinsic candidate,
 which means that some specialized optimizations may kick in to generate better
 machine code for this method. We can get the following assembly code of
@@ -489,7 +489,7 @@ There are other problems with `ShapeSerde`:
 1. Each serialized buffer has 32 unused bytes: they were 4 floating point
    values left for storing the bounding box of the geometry. We can not remove
    them from `ShapeSerde` since it has to conform with the Shapefile format.
-2. Floating point numbers were not aligned to 8-bytes boundaries. It brings
+2. Floating point numbers were not aligned to 8-byte boundaries. It brings
    some performance penalty when loading and storing coordinate values.
 3. Only 2D geometries were supported. It does not support SRID and Z/M dimensions.
 
@@ -520,14 +520,14 @@ With these principles in mind, let's design our geometry serialization format.
 
 ### The Overall Design
 
-Our proposed serialization format is similar with WKB, the major difference is that
-the coordinate values were always aligned to 8-bytes boundaries. The serialized buffer consists of 3 parts:
+Our proposed serialization format is similar to WKB, the major difference is that
+the coordinate values were always aligned to 8-byte boundaries. The serialized buffer consists of 3 parts:
 
-1. The header, which is the first 8 bytes of the serialized buffer containing the geometry type, coordinate dimensions, SRID (optional) and total number of coordinates.
+1. The header, which is the first 8 bytes of the serialized buffer containing the geometry type, coordinate dimensions, SRID (optional), and the total number of coordinates.
 2. The coordinate data, which contains the coordinates of all points in the geometry.
 3. The structure data is a series of 32-bit integers, which contains the structure of the geometry. For example, the structure of a MultiPolygon is the number of polygons, the number of rings in each polygon, and the number of coordinates in each ring.
 
-By storing coordinate data and structure data separatedly, we can make sure that the coordinate data and structure data are always aligned to word boundaries.
+By storing coordinate data and structure data separately, we can make sure that the coordinate data and structure data are always aligned to word boundaries.
 
 ```
 [   header  ] [  coordinate data  ] [  structure data  ]
@@ -545,7 +545,7 @@ The header has a fixed size of 8 bytes. It contains one preamble byte, 3 bytes f
 |< 1 byte >| |<-         3 bytes        ->| |<-   4 bytes   ->|
 ```
 
-The preamble byte is used to store the geometry type, coordinate dimensions and SRID flag. The first 4 bits are used to store the geometry type, the next 3 bits are used to store the coordinate dimensions, and the last bit is used to store the SRID flag.
+The preamble byte is used to store the geometry type, coordinate dimensions, and SRID flag. The first 4 bits are used to store the geometry type, the next 3 bits are used to store the coordinate dimensions, and the last bit is used to store the SRID flag.
 
 ```
 [ geometryType  ] [  coordinateType  ] [ SRID flag ]
@@ -574,7 +574,7 @@ The coordinate type value is defined as follows:
 | XYZM | 4 |
 
 We use 3 bytes (24 bits) to store the SRID of the geometry. The SRID flag in the preamble byte is used to indicate whether the SRID is specified. If the SRID flag is 0, the SRID is not specified and the 3 bytes for SRID are all 0. If the SRID flag is 1, the SRID is specified and the 3 bytes for SRID are used to store the SRID in
-big-endian order. We know that SRID is a 32-bit integer in JTS, thus serializing SRID as 3 bytes rules out some geometries with large SRID values. We don't think this is a problem since SRIDs larger than 16777215 are rarely used, and the [GSERIALIZED](https://github.com/postgis/postgis/blob/3.3.2/liblwgeom/gserialized.txt) format defined by PostGIS also uses 3 bytes (21 bits actually) to store SRIDs and we didn't see much complains about that.
+big-endian order. We know that SRID is a 32-bit integer in JTS, thus serializing SRID as 3 bytes rules out some geometries with large SRID values. We don't think this is a problem since SRID larger than 16777215 is rarely used, and the [GSERIALIZED](https://github.com/postgis/postgis/blob/3.3.2/liblwgeom/gserialized.txt) format defined by PostGIS also uses 3 bytes (21 bits actually) to store SRIDs and we didn't see many complaints about that.
 
 The total number of coordinates is stored in a 32-bit integer in native byte order. It is used to calculate the size of the coordinate data.
 
@@ -585,13 +585,13 @@ struct Preamable {
   int geometryType : 4;
   int coordinateType: 3;
   boolean sridFlag: 1;
-}
+};
 
 struct Header {
   Preamable preamble;
   unsigned char srid[3];
   int numCoordinates;
-}
+};
 ```
 
 #### Coordinate Data
@@ -667,7 +667,7 @@ The structure data contains the number of Polygons in the MultiPolygon, the numb
 
 A GeometryCollection is serialized as a header followed by serialized geometry data of each geometry in the collection. The `numCoordinates` field in the header should be set to the total number of geometries in the GeometryCollection.
 
-The serialized geometry data of each geometry were aligned to 8-bytes boundaries. Paddings should be added when necessary and the values of padding bytes were unspecified.
+The serialized geometry data of each geometry were aligned to 8-byte boundaries. Paddings should be added when necessary and the values of padding bytes were unspecified.
 
 ### Benchmark Results
 
